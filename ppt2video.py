@@ -8,7 +8,7 @@ import shutil
 import atexit
 import subprocess
 import os
-from PIL import Image, ImageDraw, ImageFont
+import re
 
 def parse_arguments():
     """Parses command-line arguments."""
@@ -25,6 +25,7 @@ def parse_arguments():
     parser.add_argument("--voice", default="Tingting", help="TTS voice to use (macOS only).")
     parser.add_argument("--font-file", default="/System/Library/Fonts/Hiragino Sans GB.ttc", help="Path to a .ttf or .ttc font file.")
     parser.add_argument("--font-size", type=int, default=120, help="Maximum font size for the text.")
+    parser.add_argument("--margin", type=int, default=100, help="Margin around the text.")
     parser.add_argument("--silent-duration", type=int, default=3, help="Duration for silent slides in seconds.")
     parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
     return parser.parse_args()
@@ -111,57 +112,70 @@ def markdown_to_plain_text(text: str) -> str:
         formatted_lines.append(line)
     return '\n'.join(formatted_lines)
 
-def calculate_optimal_font_size(text: str, font_file: str, max_size: int, box_width: int, box_height: int) -> int:
-    """Calculates the largest font size that allows the text to fit within the given box without wrapping."""
-    plain_text = markdown_to_plain_text(text)
-    lines = plain_text.split('\n')
+def get_text_dimensions_with_ffmpeg(text: str, font_file: str, font_size: int, margin: int, temp_dir: str) -> (int, int):
+    """
+    Uses ffmpeg in a dry-run to get the exact rendered dimensions of a text block, including margins.
+    """
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=temp_dir, suffix=".txt") as temp_text_file:
+        temp_text_file.write(text)
+        text_file_path = temp_text_file.name
     
-    # 1. Calculate font size based on the rendered width of the truly widest line
-    size_from_width = max_size
-    while size_from_width > 10:
-        font = ImageFont.truetype(font_file, size_from_width)
-        max_line_width = 0
-        for line in lines:
-            line_width = font.getlength(line)
-            if line_width > max_line_width:
-                max_line_width = line_width
+    command = [
+        "ffmpeg", "-f", "lavfi", "-i", "color=c=black", "-vf",
+        f"drawtext=fontfile='{font_file}':fontsize={font_size}:textfile='{text_file_path}':x={margin}:y={margin}:print_text=1",
+        "-f", "null", "-"
+    ]
+    
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        stderr = result.stderr
         
-        if max_line_width <= box_width:
-            break
-        size_from_width -= 2
+        width_match = re.search(r"text_w:(\d+)", stderr)
+        height_match = re.search(r"text_h:(\d+)", stderr)
+        
+        if width_match and height_match:
+            # The dimensions returned by ffmpeg are for the text only, so we add the margins back
+            # to get the total footprint of the text block on the screen.
+            return int(width_match.group(1)) + margin, int(height_match.group(1)) + margin
+        else:
+            return float('inf'), float('inf')
+    finally:
+        os.remove(text_file_path)
 
-    # 2. Calculate font size based on the total rendered height of the multi-line text block
-    size_from_height = max_size
-    dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    while size_from_height > 10:
-        font = ImageFont.truetype(font_file, size_from_height)
-        # Use multiline_textbbox for an accurate height measurement of the whole text block
-        total_height = dummy_draw.multiline_textbbox((0, 0), plain_text, font=font)[3]
-        if total_height <= box_height:
-            break
-        size_from_height -= 2
-
-    # 3. Return the smaller of the two sizes to satisfy both constraints
-    final_size = min(size_from_width, size_from_height)
-    print(f"       - Width-based size: {size_from_width}, Height-based size: {size_from_height}. Final size: {final_size}")
-    return final_size
+def calculate_optimal_font_size(text: str, font_file: str, max_size: int, screen_width: int, screen_height: int, margin: int, temp_dir: str) -> int:
+    """
+    Calculates the largest font size that allows the text to fit within the screen
+    by iteratively calling ffmpeg to get the true rendered dimensions.
+    """
+    plain_text = markdown_to_plain_text(text)
+    font_size = max_size
+    
+    print("       - Starting font size search...")
+    while font_size > 10:
+        text_w, text_h = get_text_dimensions_with_ffmpeg(plain_text, font_file, font_size, margin, temp_dir)
+        print(f"         - Testing size {font_size}: rendered footprint is {text_w}x{text_h}")
+        
+        if text_w <= screen_width and text_h <= screen_height:
+            print(f"       - Found optimal font size: {font_size}")
+            return font_size
+        
+        font_size -= 4
+        
+    return font_size
 
 def generate_video_segment(slide_data: dict, i: int, args: argparse.Namespace, temp_dir: str) -> str:
     """Generates a single video segment for a slide using an ASS subtitle file."""
     try:
         width, height = map(int, args.resolution.split('x'))
-        margin = 100
-        box_width = width - (2 * margin)
-        box_height = height - (2 * margin)
         
-        optimal_font_size = calculate_optimal_font_size(slide_data["content"], args.font_file, args.font_size, box_width, box_height)
+        optimal_font_size = calculate_optimal_font_size(slide_data["content"], args.font_file, args.font_size, width, height, args.margin, temp_dir)
 
         display_text = markdown_to_plain_text(slide_data["content"]).replace('\n', '\\N')
         font_name = os.path.basename(args.font_file).split('.')[0]
-        style = f"Style: Default,{font_name},{optimal_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,{margin},{margin},{margin},1"
+        style = f"Style: Default,{font_name},{optimal_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,{args.margin},{args.margin},{args.margin},1"
         end_time_seconds = slide_data['duration']
         end_time_str = f"{int(end_time_seconds // 3600)}:{int((end_time_seconds % 3600) // 60):02}:{end_time_seconds % 60:05.2f}"
-        ass_content = f"[Script Info]\nScriptType: v4.00+\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n{style}\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,{end_time_str},Default,,0,0,0,,{display_text}\n"
+        ass_content = f"[Script Info]\nScriptType: v4.00+\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Effect, Text\n{style}\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,{end_time_str},Default,,0,0,0,,{display_text}\n"
         ass_path = os.path.join(temp_dir, f"slide_{i}.ass")
         with open(ass_path, 'w', encoding='utf-8') as f:
             f.write(ass_content)
