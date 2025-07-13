@@ -8,6 +8,7 @@ import shutil
 import atexit
 import subprocess
 import os
+from PIL import Image, ImageDraw, ImageFont
 
 def parse_arguments():
     """Parses command-line arguments."""
@@ -21,11 +22,21 @@ def parse_arguments():
     parser.add_argument("--resolution", default="1920x1080", help="Video resolution in WxH format.")
     parser.add_argument("--bg-color", default="black", help="Video background color.")
     parser.add_argument("--bg-image", default=None, help="Path to a background image (overrides bg-color).")
-    parser.add_argument("--voice", default="Ting-Ting", help="TTS voice to use (macOS only).")
-    parser.add_argument("--font-file", default="/System/Library/Fonts/PingFang.ttc", help="Path to a .ttf or .ttc font file.")
-    parser.add_argument("--font-size", type=int, default=48, help="Font size for the text.")
+    parser.add_argument("--voice", default="Tingting", help="TTS voice to use (macOS only).")
+    parser.add_argument("--font-file", default="/System/Library/Fonts/Hiragino Sans GB.ttc", help="Path to a .ttf or .ttc font file.")
+    parser.add_argument("--font-size", type=int, default=120, help="Maximum font size for the text.")
     parser.add_argument("--silent-duration", type=int, default=3, help="Duration for silent slides in seconds.")
+    parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
     return parser.parse_args()
+
+def get_available_voices() -> list[str]:
+    """Returns a list of available voices from the 'say' command."""
+    try:
+        result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, check=True)
+        voices = [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
+        return voices
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
 
 def parse_presentation_file(filename: str) -> list[str]:
     """Parses the presentation file, splitting it into slides."""
@@ -85,8 +96,8 @@ def get_audio_duration(file_path: str) -> float:
             print(f"Stderr: {e.stderr}")
         sys.exit(1)
 
-def format_text_for_ass(text: str) -> str:
-    """Converts simple Markdown to ASS subtitle format."""
+def markdown_to_plain_text(text: str) -> str:
+    """Converts simple Markdown to plain text for measurement."""
     lines = text.split('\n')
     formatted_lines = []
     for line in lines:
@@ -98,23 +109,63 @@ def format_text_for_ass(text: str) -> str:
             line = '  • ' + line.strip()[2:]
         line = line.replace('**', '')
         formatted_lines.append(line)
-    return '\\N'.join(formatted_lines)
+    return '\n'.join(formatted_lines)
+
+def calculate_optimal_font_size(text: str, font_file: str, max_size: int, box_width: int, box_height: int) -> int:
+    """Calculates the largest font size that allows the text to fit within the given box without wrapping."""
+    plain_text = markdown_to_plain_text(text)
+    lines = plain_text.split('\n')
+    
+    # 1. Calculate font size based on the rendered width of the truly widest line
+    size_from_width = max_size
+    while size_from_width > 10:
+        font = ImageFont.truetype(font_file, size_from_width)
+        max_line_width = 0
+        for line in lines:
+            line_width = font.getlength(line)
+            if line_width > max_line_width:
+                max_line_width = line_width
+        
+        if max_line_width <= box_width:
+            break
+        size_from_width -= 2
+
+    # 2. Calculate font size based on the total rendered height of the multi-line text block
+    size_from_height = max_size
+    dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    while size_from_height > 10:
+        font = ImageFont.truetype(font_file, size_from_height)
+        # Use multiline_textbbox for an accurate height measurement of the whole text block
+        total_height = dummy_draw.multiline_textbbox((0, 0), plain_text, font=font)[3]
+        if total_height <= box_height:
+            break
+        size_from_height -= 2
+
+    # 3. Return the smaller of the two sizes to satisfy both constraints
+    final_size = min(size_from_width, size_from_height)
+    print(f"       - Width-based size: {size_from_width}, Height-based size: {size_from_height}. Final size: {final_size}")
+    return final_size
 
 def generate_video_segment(slide_data: dict, i: int, args: argparse.Namespace, temp_dir: str) -> str:
     """Generates a single video segment for a slide using an ASS subtitle file."""
     try:
-        # 1. Create ASS subtitle file
-        display_text = format_text_for_ass(slide_data["content"])
+        width, height = map(int, args.resolution.split('x'))
+        margin = 100
+        box_width = width - (2 * margin)
+        box_height = height - (2 * margin)
+        
+        optimal_font_size = calculate_optimal_font_size(slide_data["content"], args.font_file, args.font_size, box_width, box_height)
+
+        display_text = markdown_to_plain_text(slide_data["content"]).replace('\n', '\\N')
         font_name = os.path.basename(args.font_file).split('.')[0]
-        style = f"Style: Default,{font_name},{args.font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,100,100,100,1"
+        style = f"Style: Default,{font_name},{optimal_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,{margin},{margin},{margin},1"
         end_time_seconds = slide_data['duration']
         end_time_str = f"{int(end_time_seconds // 3600)}:{int((end_time_seconds % 3600) // 60):02}:{end_time_seconds % 60:05.2f}"
-        ass_content = f"[Script Info]\nTitle: ppt2video\nScriptType: v4.00+\nWrapStyle: 0\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n{style}\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,{end_time_str},Default,,0,0,0,,{display_text}\n"
+        ass_content = f"[Script Info]\nScriptType: v4.00+\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n{style}\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,{end_time_str},Default,,0,0,0,,{display_text}\n"
         ass_path = os.path.join(temp_dir, f"slide_{i}.ass")
         with open(ass_path, 'w', encoding='utf-8') as f:
             f.write(ass_content)
 
-        # 2. Build ffmpeg command
         command = ["ffmpeg"]
         if args.bg_image:
             command.extend(["-loop", "1", "-i", args.bg_image])
@@ -148,7 +199,11 @@ def concatenate_videos(segment_paths: list[str], output_path: str, temp_dir: str
         with open(concat_list_path, 'w') as f:
             for path in segment_paths:
                 f.write(f"file '{os.path.abspath(path)}'\n")
-        command = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", "-y", output_path]
+        command = [
+            "ffmpeg", "-f", "concat", "-safe", "0", "-i", concat_list_path,
+            "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
+            "-y", output_path
+        ]
         subprocess.run(command, check=True, capture_output=True, text=True)
         print(f"\nFinal video successfully generated at: {output_path}")
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
@@ -160,24 +215,40 @@ def concatenate_videos(segment_paths: list[str], output_path: str, temp_dir: str
 def main():
     """Main function to run the script."""
     args = parse_arguments()
+    
+    if args.list_voices:
+        print("Available TTS voices:")
+        voices = get_available_voices()
+        if voices:
+            for voice in voices:
+                print(f"  - {voice}")
+        else:
+            print("Could not retrieve voices. Is 'say' command available?")
+        sys.exit(0)
+
     temp_dir = tempfile.mkdtemp()
     atexit.register(shutil.rmtree, temp_dir)
 
     print("---------------------------------")
     print("PPT to Video Converter (Python)")
     print("---------------------------------")
+    
+    available_voices = get_available_voices()
+    if available_voices and args.voice not in available_voices:
+        print(f"Error: Voice '{args.voice}' not found on this system.")
+        print("Use --list-voices to see available options.")
+        sys.exit(1)
+    
     for key, value in vars(args).items():
         print(f"{key.replace('_', ' ').capitalize():<20}: {value}")
     print(f"{'Temporary dir':<20}: {temp_dir}")
     print("---------------------------------")
 
-    # 1. Parse files
     print("1. Parsing files...")
     slides = parse_presentation_file(args.presentation)
     narrations = parse_script_file(args.script)
     print(f"   - Found {len(slides)} slides and {len(narrations)} narration blocks.")
 
-    # 2. Generate audio and prepare slide data
     print("\n2. Preparing slide data (and generating audio)...")
     slide_data_list = []
     for i, slide_content in enumerate(slides):
@@ -190,7 +261,7 @@ def main():
         data = {"title": slide_title, "content": slide_content, "audio_path": None, "duration": args.silent_duration}
         narration = narrations.get(slide_title)
         if narration:
-            audio_path = os.path.join(temp_dir, f"slide_{i}.aiff")
+            audio_path = os.path.join(temp_dir, f"slide_{i+1}.aiff")
             generate_audio_file(narration, args.voice, audio_path, temp_dir)
             duration = get_audio_duration(audio_path)
             data["audio_path"] = audio_path
@@ -198,7 +269,6 @@ def main():
         slide_data_list.append(data)
     print("   - Slide data preparation complete.")
 
-    # 3. Generate video segments
     print("\n3. Generating video segments...")
     segment_paths = []
     for i, slide_data in enumerate(slide_data_list):
@@ -207,7 +277,6 @@ def main():
         segment_paths.append(segment_path)
         print(f"     - Segment generated: {segment_path}")
 
-    # 4. Concatenate segments
     print("\n4. Assembling final video...")
     concatenate_videos(segment_paths, args.output, temp_dir)
 
