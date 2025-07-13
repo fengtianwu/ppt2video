@@ -8,7 +8,8 @@ import shutil
 import atexit
 import subprocess
 import os
-from PIL import ImageFont
+import re
+from PIL import Image, ImageDraw, ImageFont
 
 def parse_arguments():
     """Parses command-line arguments."""
@@ -67,11 +68,17 @@ def parse_script_file(filename: str) -> dict[str, str]:
         print(f"Error: Script file not found at '{filename}'")
         sys.exit(1)
 
+def preprocess_text_for_tts(text: str) -> str:
+    """Preprocesses text to improve TTS pronunciation for specific acronyms."""
+    # Use word boundaries (\b) to only match the whole word "AI"
+    return re.sub(r'\bAI\b', 'A. I.', text, flags=re.IGNORECASE)
+
 def generate_audio_file(text: str, voice: str, output_path: str, temp_dir: str) -> str:
     """Generates an AIFF audio file from text using the 'say' command."""
     try:
+        processed_text = preprocess_text_for_tts(text)
         with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=temp_dir, suffix=".txt") as temp_text_file:
-            temp_text_file.write(text)
+            temp_text_file.write(processed_text)
             temp_text_path = temp_text_file.name
         command = ["say", "-v", voice, "-o", output_path, "--file-format=AIFF", "-f", temp_text_path]
         subprocess.run(command, check=True, capture_output=True, text=True)
@@ -119,12 +126,10 @@ def calculate_optimal_font_size(text: str, font_file: str, max_size: int, box_wi
     while size > 10:
         font = ImageFont.truetype(font_file, size)
         
-        # Check width
         max_w = 0
         for line in lines:
             max_w = max(max_w, font.getlength(line))
         
-        # Check height
         total_h = sum(font.getmetrics()) * len(lines)
 
         if max_w <= box_width and total_h <= box_height:
@@ -133,8 +138,52 @@ def calculate_optimal_font_size(text: str, font_file: str, max_size: int, box_wi
         
     return size
 
+def generate_slide_image(slide_content: str, optimal_font_size: int, args: argparse.Namespace, output_path: str):
+    """Generates a single PNG image for a slide with the given font size and mixed alignment."""
+    plain_text = markdown_to_plain_text(slide_content)
+    lines = plain_text.split('\n')
+    
+    width, height = map(int, args.resolution.split('x'))
+    
+    if args.bg_image:
+        img = Image.open(args.bg_image).resize((width, height))
+    else:
+        img = Image.new('RGB', (width, height), color=args.bg_color)
+        
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype(args.font_file, optimal_font_size)
+    
+    # 1. Calculate the overall bounding box to center the whole text block vertically
+    bbox = draw.multiline_textbbox((0, 0), plain_text, font=font, spacing=4)
+    total_text_h = bbox[3] - bbox[1]
+    y_start = (height - total_text_h) / 2
+    
+    # 2. Draw line by line with custom alignment
+    current_y = y_start
+    for i, line in enumerate(lines):
+        line_w = font.getlength(line)
+        
+        # Center the title (first line), left-align the rest
+        if i == 0:
+            x = (width - line_w) / 2
+        else:
+            # Find the width of the widest line to align all content lines
+            max_content_w = 0
+            for content_line in lines[1:]:
+                max_content_w = max(max_content_w, font.getlength(content_line))
+            x = (width - max_content_w) / 2
+
+        draw.text((x, current_y), line, font=font, fill="white")
+        
+        # Move to the next line's position
+        ascent, descent = font.getmetrics()
+        current_y += ascent + descent + 4 # 4 is the spacing used in bbox calculation
+    
+    img.save(output_path)
+
+
 def generate_video_segment(slide_data: dict, i: int, args: argparse.Namespace, temp_dir: str) -> str:
-    """Generates a single video segment for a slide using ffmpeg's drawtext filter."""
+    """Generates a single video segment for a slide from its image and audio."""
     try:
         width, height = map(int, args.resolution.split('x'))
         box_width = width - (2 * args.margin)
@@ -143,32 +192,27 @@ def generate_video_segment(slide_data: dict, i: int, args: argparse.Namespace, t
         optimal_font_size = calculate_optimal_font_size(slide_data["content"], args.font_file, args.font_size, box_width, box_height)
         print(f"     - Calculated optimal font size: {optimal_font_size}")
 
-        display_text = markdown_to_plain_text(slide_data["content"])
-        text_file_path = os.path.join(temp_dir, f"slide_{i}.txt")
-        with open(text_file_path, 'w', encoding='utf-8') as f:
-            f.write(display_text)
+        image_path = os.path.join(temp_dir, f"slide_{i}.png")
+        generate_slide_image(slide_data["content"], optimal_font_size, args, image_path)
+        print(f"     - Image generated: {image_path}")
 
         command = ["ffmpeg"]
-        if args.bg_image:
-            command.extend(["-loop", "1", "-i", args.bg_image])
-        else:
-            command.extend(["-f", "lavfi", "-i", f"color=c={args.bg_color}:s={args.resolution}"])
+        command.extend(["-loop", "1", "-i", image_path]) # Loop the image
         
         if slide_data["audio_path"]:
             command.extend(["-i", slide_data["audio_path"]])
         else:
             command.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
 
-        video_filter = (
-            f"drawtext=fontfile='{args.font_file}':textfile='{text_file_path}':"
-            f"fontcolor=white:fontsize={optimal_font_size}:"
-            f"x=(w-text_w)/2:y=(h-text_h)/2"
-        )
         audio_filter = "aformat=channel_layouts=stereo:sample_rates=44100"
-        command.extend(["-vf", video_filter, "-af", audio_filter])
+        command.extend(["-af", audio_filter])
         
         output_path = os.path.join(temp_dir, f"segment_{i}.mp4")
-        command.extend(["-c:v", "libx264", "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-t", str(slide_data["duration"]), "-shortest", "-y", output_path])
+        command.extend([
+            "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p", "-t", str(slide_data["duration"]), 
+            "-shortest", "-y", output_path
+        ])
         
         subprocess.run(command, check=True, capture_output=True, text=True)
         return output_path
