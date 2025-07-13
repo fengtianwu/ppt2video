@@ -6,16 +6,15 @@ This document outlines the rules for generating two synchronized Markdown files:
 
 ## 1. File 1: The Presentation File (`presentation.md`)
 
-This file contains the visual content that will be displayed on each slide of the video.
+This file contains the visual content that will be displayed on each slide of the video. The script will automatically scale the font size of the entire text block to ensure it fits on the screen. **The script does not automatically wrap long lines.** Therefore, it is the responsibility of the content creator to insert manual line breaks where desired.
 
 ### **Rules:**
 
 1.  **File Format**: Must be a Markdown (`.md`) file.
 2.  **Slide Separation**: Each slide MUST be separated from the next by a Markdown horizontal rule (`---`).
 3.  **Slide Identification**:
-    *   Each slide's content MUST begin with a Level 2 Markdown Header (`##`).
-    *   The header format MUST be `## Slide <N>: <Slide Title>`, where `<N>` is the sequential slide number and `<Slide Title>` is the title for that slide.
-4.  **Content**: The body of the slide (e.g., bullet points, text) should follow its `##` header.
+    *   Each slide's content SHOULD begin with a Level 1 or Level 2 Markdown Header (`#` or `##`). This header is used for titling the slide in the script file.
+4.  **Content**: The body of the slide (e.g., bullet points, text) should follow its header. Manual line breaks should be used to structure the text, as automatic wrapping is not performed.
 
 ### **Example `presentation.md`:**
 

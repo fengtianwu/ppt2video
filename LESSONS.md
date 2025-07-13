@@ -1,36 +1,30 @@
-### **Summary of Problems and Lessons Learned**
+### **Summary of Problems and Lessons Learned (ppt2video)**
 
-This document summarizes the key problems encountered during development. Each lesson is assigned an **Error Count**, representing the number of times a category of error caused a failure during our interactive session. Lessons with a higher count were more problematic and should be given special attention in future projects.
+This document summarizes the key problems encountered during the development of the `ppt2video` project. The process was iterative and involved several major refactors.
 
 ---
 
-**1. Problem: Font Rendering, Measurement, and CJK Support (Error Count: 7)**
-*   **Issue**: This was the most persistent category of error. Problems included:
-    1.  Rendering Chinese characters as "tofu" squares because the default font lacked the necessary glyphs.
-    2.  Incorrectly wrapping Chinese text because the logic was word-based (splitting on spaces) instead of character-based.
-    3.  Failing to find the correct path to system fonts (`PingFang.ttc`, `STHeitiTC-Medium.ttc`), even with hardcoded paths, due to the complexities of the macOS font system.
-*   **Lesson**: Robust multilingual text rendering is extremely difficult.
-    1.  **Unify Font Handling**: The exact same font file must be used for both text measurement (`Pillow`) and video rendering (`ffmpeg`).
-    2.  **Use CJK-Compatible Fonts**: When CJK text is detected, the script must switch to a known compatible font. The most reliable way to find this font is to use a system utility (e.g., `system_profiler SPFontsDataType`) to get the exact, full path, as simple paths are unreliable.
-    3.  **Wrap Character-by-Character**: Logic must iterate character-by-character, not word-by-word, to correctly handle all languages.
-    4.  **Provide User Overrides**: Always allow the user to specify their own font file (`--font-file`) as a final fallback.
+**1. Problem: Font Layout and Sizing (The Core Challenge)**
+*   **Issue**: This was by far the most difficult and persistent problem. The core challenge was ensuring that text of any length would fit perfectly within the video frame without overflowing.
+    1.  **Initial `drawtext` Failure**: The first approach using `ffmpeg`'s `drawtext` filter was abandoned because it does not support automatic text wrapping, which I mistakenly thought was a requirement.
+    2.  **The `Pillow` Guesswork Fallacy**: The subsequent, and most time-consuming, error was trying to use the Python `Pillow` library to *predict* how `ffmpeg`'s ASS/`subtitles` filter would render text. This approach was fundamentally flawed because the two systems have completely different typographic engines. Their calculations for line height, character spacing, and margins are not interchangeable. This led to a frustrating cycle of the font being either too large (overflowing) or too small (too much padding).
+    3.  **The `ffmpeg` Dry-Run Failure**: An attempt to have `ffmpeg` measure the text itself via a "dry-run" mode proved to be unreliable and inconsistent across environments, failing to return the necessary dimension data.
+*   **Final Lesson & Solution**: The simplest path was the correct one all along. The final, successful algorithm returned to using `drawtext`, embracing its lack of automatic wrapping.
+    1.  **Trust a Single Source of Truth**: All text measurement should be done in a single, consistent environment before being passed to the final renderer. The successful approach used `Pillow` to calculate the optimal font size based on the slide's longest line and total number of lines.
+    2.  **No Magic Numbers**: The final algorithm does not rely on "magic number" multipliers for line spacing. It calculates the total height of the text block directly.
+    3.  **Define the Requirement Clearly**: The breakthrough came when the requirement was clarified to **"Do not wrap lines; scale the font to fit."** This immediately made `drawtext` the correct tool for the job.
 
-**2. Problem: Complex Dependencies and Environment Issues (Error Count: 6)**
-*   **Issue**: An attempt to render full Markdown formatting using `WeasyPrint` failed due to intractable environment issues. The library could not find its C-language dependencies (`pango`, `libffi`) because of conflicts between the system's Python environment (Anaconda) and Homebrew-installed libraries. Setting environment variables (`DYLD_LIBRARY_PATH`, `LDFLAGS`) was not sufficient to resolve the runtime linking errors.
-*   **Lesson**: Avoid complex C-dependencies when a simpler solution exists. The runtime environment is the hardest variable to control. A feature is not worth implementing if it makes the tool brittle and difficult to install. **Prioritize reliability over features.**
+**2. Problem: External Command Integration (`say`, `ffprobe`, `ffmpeg`)**
+*   **Issue**: Integrating with command-line tools presented several challenges.
+    1.  **`say`**: The macOS TTS command failed silently if a voice was misspelled (e.g., `Ting-Ting` vs. `Tingting`). It also had issues when very long strings were passed directly on the command line.
+    2.  **`afinfo`**: This macOS-specific tool for getting audio duration proved unreliable, with its output format being inconsistent and sometimes printing to `stderr` instead of `stdout`.
+    3.  `ffmpeg`: The `concat` demuxer is very strict about stream properties. Mismatches in audio sample rates or channel layouts between silent and narrated segments caused the final video to have no sound.
+*   **Lesson**: External commands are fragile dependencies.
+    1.  **Validate Inputs**: Always validate inputs passed to external commands (e.g., check if a voice exists before calling `say`). The final script added a `--list-voices` option and a startup check.
+    2.  **Use Robust Tools**: `ffprobe` is a much more reliable and standard tool for media introspection than `afinfo`.
+    3.  **Standardize Streams**: When combining media, always re-encode or filter them to a common, standard format (`aformat` and `-c:a aac` in our case) before the final concatenation step.
+    4.  **Avoid Passing Large Data via CLI**: Pass large blocks of text to commands via temporary files (`-f` for `say`, `textfile` for `drawtext`) to avoid shell argument length limits.
 
-**3. Problem: Basic Python Scripting Errors (Error Count: 5)**
-*   **Issue**: The development process was plagued by simple `NameError`, `SyntaxError`, and `IndentationError` issues. These were often caused by incorrect refactoring, such as moving the `parser.parse_args()` call to the wrong place or having incorrect indentation in a `try...except` block.
-*   **Lesson**: Even with a modular approach, careful attention to basic Python syntax and structure is critical. Frequent, small-scale testing after every change is necessary to catch these simple errors before they compound.
-
-**4. Problem: System Command Integration (`say`) (Error Count: 3)**
-*   **Issue**: The macOS `say` command failed in non-obvious ways. It produced a "Bad file descriptor" error when text was piped to it incorrectly, and it failed silently (producing no audio) when a specified voice was not installed or misnamed (`Ting-Ting` vs. `Tingting`).
-*   **Lesson**: System commands are external dependencies that can be fragile. It's crucial to add robust error handling that checks for failures and provides users with helpful diagnostic hints (e.g., "Voice not found, run `say -v '?'` to see available voices.").
-
-**5. Problem: Incorrect Business Logic (Markdown Parsing) (Error Count: 1)**
-*   **Issue**: The initial implementation of Markdown support stripped all blank lines during the conversion to plain text. This broke the scene-splitting logic, which relies on those blank lines as delimiters.
-*   **Lesson**: When transforming data from one format to another, ensure the transformation preserves the essential metadata required by later processing steps. The conversion from Markdown to plain text needed to be more intelligent, preserving paragraph breaks as double newlines for the scene splitter.
-
-**6. Problem: Foundational Design (Shell Scripting) (Error Count: 1)**
-*   **Issue**: The very first attempt at this tool was a shell script, which was immediately plagued by subtle syntax errors and an inability to handle floating-point math.
-*   **Lesson**: Use the right tool for the job. For tasks involving complex string manipulation, process orchestration, and math, a high-level scripting language like Python is far more robust and appropriate than shell scripting.
+**3. Problem: Foundational Design (Shell vs. Python)**
+*   **Issue**: The initial attempt to build the tool as a `bash` script quickly failed due to `bash`'s limitations in handling arrays portably and its lack of floating-point arithmetic.
+*   **Lesson**: Use the right tool for the job. For a project involving process orchestration, floating-point math, and complex data manipulation, Python is a far superior choice to shell scripting.
