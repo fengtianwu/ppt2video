@@ -8,7 +8,7 @@ import shutil
 import atexit
 import subprocess
 import os
-import re
+from PIL import ImageFont
 
 def parse_arguments():
     """Parses command-line arguments."""
@@ -26,16 +26,15 @@ def parse_arguments():
     parser.add_argument("--font-file", default="/System/Library/Fonts/Hiragino Sans GB.ttc", help="Path to a .ttf or .ttc font file.")
     parser.add_argument("--font-size", type=int, default=120, help="Maximum font size for the text.")
     parser.add_argument("--margin", type=int, default=100, help="Margin around the text.")
-    parser.add_argument("--silent-duration", type=int, default=3, help="Duration for silent slides in seconds.")
     parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
+    parser.add_argument("--silent-duration", type=int, default=3, help="Duration for silent slides in seconds.")
     return parser.parse_args()
 
 def get_available_voices() -> list[str]:
     """Returns a list of available voices from the 'say' command."""
     try:
         result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, check=True)
-        voices = [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
-        return voices
+        return [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
     except (FileNotFoundError, subprocess.CalledProcessError):
         return []
 
@@ -43,8 +42,7 @@ def parse_presentation_file(filename: str) -> list[str]:
     """Parses the presentation file, splitting it into slides."""
     try:
         with open(filename, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return [slide.strip() for slide in content.split('\n---\n') if slide.strip()]
+            return [s.strip() for s in f.read().split('\n---\n') if s.strip()]
     except FileNotFoundError:
         print(f"Error: Presentation file not found at '{filename}'")
         sys.exit(1)
@@ -112,73 +110,43 @@ def markdown_to_plain_text(text: str) -> str:
         formatted_lines.append(line)
     return '\n'.join(formatted_lines)
 
-def get_text_dimensions_with_ffmpeg(text: str, font_file: str, font_size: int, margin: int, temp_dir: str) -> (int, int):
-    """
-    Uses ffmpeg in a dry-run to get the exact rendered dimensions of a text block, including margins.
-    """
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=temp_dir, suffix=".txt") as temp_text_file:
-        temp_text_file.write(text)
-        text_file_path = temp_text_file.name
-    
-    command = [
-        "ffmpeg", "-f", "lavfi", "-i", "color=c=black", "-vf",
-        f"drawtext=fontfile='{font_file}':fontsize={font_size}:textfile='{text_file_path}':x={margin}:y={margin}:print_text=1",
-        "-f", "null", "-"
-    ]
-    
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        stderr = result.stderr
-        
-        width_match = re.search(r"text_w:(\d+)", stderr)
-        height_match = re.search(r"text_h:(\d+)", stderr)
-        
-        if width_match and height_match:
-            # The dimensions returned by ffmpeg are for the text only, so we add the margins back
-            # to get the total footprint of the text block on the screen.
-            return int(width_match.group(1)) + margin, int(height_match.group(1)) + margin
-        else:
-            return float('inf'), float('inf')
-    finally:
-        os.remove(text_file_path)
-
-def calculate_optimal_font_size(text: str, font_file: str, max_size: int, screen_width: int, screen_height: int, margin: int, temp_dir: str) -> int:
-    """
-    Calculates the largest font size that allows the text to fit within the screen
-    by iteratively calling ffmpeg to get the true rendered dimensions.
-    """
+def calculate_optimal_font_size(text: str, font_file: str, max_size: int, box_width: int, box_height: int) -> int:
+    """Calculates the largest font size that allows the text to fit within the given box without wrapping."""
     plain_text = markdown_to_plain_text(text)
-    font_size = max_size
+    lines = plain_text.split('\n')
     
-    print("       - Starting font size search...")
-    while font_size > 10:
-        text_w, text_h = get_text_dimensions_with_ffmpeg(plain_text, font_file, font_size, margin, temp_dir)
-        print(f"         - Testing size {font_size}: rendered footprint is {text_w}x{text_h}")
+    size = max_size
+    while size > 10:
+        font = ImageFont.truetype(font_file, size)
         
-        if text_w <= screen_width and text_h <= screen_height:
-            print(f"       - Found optimal font size: {font_size}")
-            return font_size
+        # Check width
+        max_w = 0
+        for line in lines:
+            max_w = max(max_w, font.getlength(line))
         
-        font_size -= 4
+        # Check height
+        total_h = sum(font.getmetrics()) * len(lines)
+
+        if max_w <= box_width and total_h <= box_height:
+            return size
+        size -= 2
         
-    return font_size
+    return size
 
 def generate_video_segment(slide_data: dict, i: int, args: argparse.Namespace, temp_dir: str) -> str:
-    """Generates a single video segment for a slide using an ASS subtitle file."""
+    """Generates a single video segment for a slide using ffmpeg's drawtext filter."""
     try:
         width, height = map(int, args.resolution.split('x'))
+        box_width = width - (2 * args.margin)
+        box_height = height - (2 * args.margin)
         
-        optimal_font_size = calculate_optimal_font_size(slide_data["content"], args.font_file, args.font_size, width, height, args.margin, temp_dir)
+        optimal_font_size = calculate_optimal_font_size(slide_data["content"], args.font_file, args.font_size, box_width, box_height)
+        print(f"     - Calculated optimal font size: {optimal_font_size}")
 
-        display_text = markdown_to_plain_text(slide_data["content"]).replace('\n', '\\N')
-        font_name = os.path.basename(args.font_file).split('.')[0]
-        style = f"Style: Default,{font_name},{optimal_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,7,{args.margin},{args.margin},{args.margin},1"
-        end_time_seconds = slide_data['duration']
-        end_time_str = f"{int(end_time_seconds // 3600)}:{int((end_time_seconds % 3600) // 60):02}:{end_time_seconds % 60:05.2f}"
-        ass_content = f"[Script Info]\nScriptType: v4.00+\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Effect, Text\n{style}\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,{end_time_str},Default,,0,0,0,,{display_text}\n"
-        ass_path = os.path.join(temp_dir, f"slide_{i}.ass")
-        with open(ass_path, 'w', encoding='utf-8') as f:
-            f.write(ass_content)
+        display_text = markdown_to_plain_text(slide_data["content"])
+        text_file_path = os.path.join(temp_dir, f"slide_{i}.txt")
+        with open(text_file_path, 'w', encoding='utf-8') as f:
+            f.write(display_text)
 
         command = ["ffmpeg"]
         if args.bg_image:
@@ -191,7 +159,11 @@ def generate_video_segment(slide_data: dict, i: int, args: argparse.Namespace, t
         else:
             command.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"])
 
-        video_filter = f"subtitles='{os.path.abspath(ass_path)}'"
+        video_filter = (
+            f"drawtext=fontfile='{args.font_file}':textfile='{text_file_path}':"
+            f"fontcolor=white:fontsize={optimal_font_size}:"
+            f"x=(w-text_w)/2:y=(h-text_h)/2"
+        )
         audio_filter = "aformat=channel_layouts=stereo:sample_rates=44100"
         command.extend(["-vf", video_filter, "-af", audio_filter])
         
