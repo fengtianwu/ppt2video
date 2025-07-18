@@ -20,6 +20,7 @@ The script is configurable via a rich set of command-line options:
 *   `--resolution <WxH>`: Video resolution. (Default: `1920x1080`)
 *   `--voice <name>`: Specify the TTS voice to use (e.g., `Tingting`).
 *   `--silent-duration <sec>`: Duration for silent slides. (Default: `3`)
+*   `--narration-delay <sec>`: Delay in seconds before narration starts on each slide. (Default: `0.0`)
 *   `--list-voices`: List all available TTS voices on the system and exit.
 *   `--help`: Display the help message.
 

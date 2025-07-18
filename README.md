@@ -52,7 +52,8 @@ This will generate an `output.mp4` file in the current directory.
 | `--font-file <path>`  | Path to a `.ttf` or `.ttc` font file.                       | `/System/Library/Fonts/Hiragino Sans GB.ttc`  |
 | `--font-size <num>`   | **Maximum** font size for dynamic scaling.                  | `120`                                         |
 | `--margin <num>`      | Margin around the text block in pixels.                     | `100`                                         |
-| `--silent-duration <sec>` | Duration for silent slides in seconds.                    | `3`                                           |
+| `--silent-duration <sec>` | Duration for silent slides in seconds.    | `3`                                           |
+| `--narration-delay <sec>` | Delay in seconds before narration starts on each slide. | `0.0`                                         |
 | `--list-voices`       | List all available TTS voices on the system and exit.       | -                                             |
 | `--help`              | Display the help message.                                   | -                                             |
 
