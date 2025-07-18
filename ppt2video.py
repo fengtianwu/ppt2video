@@ -24,6 +24,7 @@ def parse_arguments():
     parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
     parser.add_argument("--silent-duration", type=int, default=3, help="Duration for silent slides in seconds.")
     parser.add_argument("--chars-per-second", type=int, default=20, help="Characters per second for reading time calculation.")
+    parser.add_argument("--narration-delay", type=float, default=0.0, help="Delay in seconds before narration starts on each slide.")
     return parser.parse_args()
 
 def check_dependencies(is_tex: bool):
@@ -238,18 +239,22 @@ def get_audio_duration(file_path: str) -> float:
         print(f"Error getting audio duration: {e}")
         sys.exit(1)
 
-def generate_video_segment(image_path: str, audio_path: str, duration: float, output_path: str, resolution: str) -> str:
+def generate_video_segment(image_path: str, audio_path: str, duration: float, output_path: str, resolution: str, narration_delay: float) -> str:
     """Generates a single video segment for a slide from its image and audio."""
     try:
         width, height = resolution.split('x')
         command = ["ffmpeg", "-y", "-loop", "1", "-i", image_path]
         
+        # Create a silent audio track for the delay
+        silent_audio_input = f"anullsrc=channel_layout=stereo:sample_rate=44100:d={narration_delay}"
+
         if audio_path:
+            # Concatenate silent audio with narration audio
             command.extend(["-i", audio_path])
-            audio_filter = "aformat=channel_layouts=stereo:sample_rates=44100"
-            command.extend(["-af", audio_filter])
-        else: # Silent slide
-            command.extend(["-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=44100:d={duration}"])
+            audio_filter = f"{silent_audio_input}[silent];[silent][1:a]concat=n=2:v=0:a=1[aout]"
+            command.extend(["-filter_complex", audio_filter, "-map", "[aout]", "-map", "0:v"])
+        else: # Silent slide, just use the delay as the audio
+            command.extend(["-f", "lavfi", "-i", silent_audio_input])
 
         command.extend([
             "-c:v", "libx264", "-c:a", "aac", "-b:a", "192k",
@@ -405,7 +410,7 @@ def main():
     slide_data_list = []
     for i, image_path in enumerate(image_paths):
         slide_num = i + 1
-        data = {"image_path": image_path, "audio_path": None, "duration": args.silent_duration}
+        data = {"image_path": image_path, "audio_path": None, "duration": args.silent_duration + args.narration_delay}
         narration = narrations.get(slide_num)
         
         if narration:
@@ -414,10 +419,10 @@ def main():
             generate_audio_file(narration, args.voice, audio_path, temp_dir)
             duration = get_audio_duration(audio_path)
             data["audio_path"] = audio_path
-            data["duration"] = duration
-            print(f"     - Audio generated: {audio_path} (Duration: {duration:.2f}s)")
+            data["duration"] = duration + args.narration_delay
+            print(f"     - Audio generated: {audio_path} (Duration: {duration:.2f}s + {args.narration_delay:.2f}s delay)")
         else:
-            print(f"   - Slide {slide_num} is silent (Duration: {args.silent_duration}s).")
+            print(f"   - Slide {slide_num} is silent (Duration: {args.silent_duration}s + {args.narration_delay:.2f}s delay).")
             
         slide_data_list.append(data)
 
@@ -426,7 +431,7 @@ def main():
     for i, slide_data in enumerate(slide_data_list):
         print(f"   - Generating segment for Slide {i+1}...")
         segment_path = os.path.join(temp_dir, f"segment_{i+1}.mp4")
-        generate_video_segment(slide_data["image_path"], slide_data["audio_path"], slide_data["duration"], segment_path, args.resolution)
+        generate_video_segment(slide_data["image_path"], slide_data["audio_path"], slide_data["duration"], segment_path, args.resolution, args.narration_delay)
         segment_paths.append(segment_path)
         print(f"     - Segment generated: {segment_path}")
 
