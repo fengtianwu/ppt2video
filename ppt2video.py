@@ -23,18 +23,25 @@ def parse_arguments():
     parser.add_argument("--voice", default="Tingting", help="TTS voice to use (macOS only).")
     parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
     parser.add_argument("--silent-duration", type=int, default=3, help="Duration for silent slides in seconds.")
+    parser.add_argument("--chars-per-second", type=int, default=20, help="Characters per second for reading time calculation.")
     return parser.parse_args()
 
 def check_dependencies(is_tex: bool):
     """Checks for required command-line tool dependencies."""
-    if is_tex and not shutil.which("pdflatex"):
-        print("Error: pdflatex command not found. Is a LaTeX distribution (like MacTeX) installed?")
+    if is_tex and not shutil.which("xelatex"):
+        print("Error: xelatex command not found. Is a LaTeX distribution (like MacTeX) installed?")
         sys.exit(1)
     if not shutil.which("ffmpeg"):
         print("Error: ffmpeg command not found. Please install it.")
         sys.exit(1)
-    if not shutil.which("ffprobe"):
-        print("Error: ffprobe command not found. Please install it.")
+    if not shutil.which("pdfinfo"):
+        print("Error: pdfinfo command not found. Is poppler installed? (e.g., 'brew install poppler')")
+        sys.exit(1)
+    if not shutil.which("pdftoppm"):
+        print("Error: pdftoppm command not found. Is poppler installed? (e.g., 'brew install poppler')")
+        sys.exit(1)
+    if not shutil.which("pdftotext"):
+        print("Error: pdftotext command not found. Is poppler installed? (e.g., 'brew install poppler')")
         sys.exit(1)
     if sys.platform == "darwin" and not shutil.which("say"):
         print("Error: 'say' command not found. This script currently relies on macOS for TTS.")
@@ -78,6 +85,28 @@ def compile_latex_to_pdf(tex_file: str, temp_dir: str) -> str:
             print(f"stderr:\n{e.stderr}")
         sys.exit(1)
 
+def get_pdf_dimensions(pdf_path: str) -> tuple[int, int]:
+    """Gets the dimensions (width, height) of the first page of a PDF using pdfinfo."""
+    try:
+        command = ["pdfinfo", pdf_path]
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        width, height = 0, 0
+        for line in result.stdout.splitlines():
+            if line.lower().startswith("page size:"):
+                # Example: Page size: 595 x 842 pts (A4)
+                parts = line.split()
+                width = float(parts[2])
+                height = float(parts[4])
+                break
+        if width == 0 or height == 0:
+            raise ValueError("Could not find page size in pdfinfo output.")
+        return int(width), int(height)
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
+        print(f"Error getting PDF dimensions: {e}")
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"Stderr: {e.stderr}")
+        sys.exit(1)
+
 def get_pdf_page_count(pdf_path: str) -> int:
     """Gets the number of pages in a PDF file using pdfinfo."""
     try:
@@ -94,15 +123,31 @@ def get_pdf_page_count(pdf_path: str) -> int:
         sys.exit(1)
 
 def extract_pdf_pages_as_images(pdf_path: str, page_count: int, resolution: str, temp_dir: str) -> list[str]:
-    """Extracts each page of a PDF into a PNG image file using pdftoppm."""
+    """Extracts each page of a PDF into a PNG image file using pdftoppm, preserving aspect ratio."""
     print("   - Extracting PDF pages as images using pdftoppm...")
-    width, height = resolution.split('x')
+    target_width, target_height = map(int, resolution.split('x'))
+
+    # Get original PDF dimensions to calculate aspect ratio
+    pdf_width, pdf_height = get_pdf_dimensions(pdf_path)
+    pdf_aspect_ratio = pdf_width / pdf_height
+
+    # Calculate scaling to fit within target resolution while preserving aspect ratio
+    # Scale by width
+    scale_width = target_width
+    scale_height = int(target_width / pdf_aspect_ratio)
+
+    if scale_height > target_height:
+        # If scaling by width makes height too large, scale by height instead
+        scale_height = target_height
+        scale_width = int(target_height * pdf_aspect_ratio)
+
     output_prefix = os.path.join(temp_dir, "slide")
     command = [
         "pdftoppm",
         "-png",
-        "-scale-to-x", width,
-        "-scale-to-y", height,
+        "-r", "300", # Set DPI to 300 for higher quality output
+        "-scale-to-x", str(scale_width),
+        "-scale-to-y", str(scale_height),
         pdf_path,
         output_prefix
     ]
@@ -128,29 +173,41 @@ def extract_pdf_pages_as_images(pdf_path: str, page_count: int, resolution: str,
         sys.exit(1)
 
 
-def parse_script_file(filename: str, total_slides: int) -> dict[int, str]:
-    """Parses the script file into a dictionary mapping slide numbers to narrations."""
-    narrations = {}
+def get_text_from_pdf_page(pdf_path: str, page_num: int) -> str:
+    """Extracts text from a specific page of a PDF using pdftotext."""
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            content = f.read()
-        blocks = [block.strip() for block in content.split('\n---\n') if block.strip()]
-        
-        for block in blocks:
-            match = re.search(r'\(幻灯片\s*(\d+):', block)
-            if match:
-                slide_num = int(match.group(1))
-                if 1 <= slide_num <= total_slides:
-                    narrations[slide_num] = block
-    except FileNotFoundError:
-        print(f"Error: Script file not found at '{filename}'")
+        # pdftotext uses 1-based indexing for pages
+        command = ["pdftotext", "-f", str(page_num), "-l", str(page_num), pdf_path, "-"]
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        return result.stdout.strip()
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"Error extracting text from PDF page {page_num}: {e}")
+        if isinstance(e, subprocess.CalledProcessError):
+            print(f"Stderr: {e.stderr}")
         sys.exit(1)
-    return narrations
+
+def calculate_reading_time(text: str, chars_per_second: int) -> float:
+    """Calculates reading time based on character count and reading speed."""
+    if not text or chars_per_second <= 0:
+        return 0.0
+    # Count Chinese characters as 2, English characters as 1
+    char_count = 0
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':  # Check if it's a Chinese character
+            char_count += 2
+        else:
+            char_count += 1
+    return char_count / chars_per_second
 
 def preprocess_text_for_tts(text: str) -> str:
     """Preprocesses text to improve TTS pronunciation and remove metadata."""
-    text = re.sub(r'\(幻灯片\s*\d+:[^\)]*\)', '', text)
+    # Remove [cite_start] and [cite n] markers
     text = re.sub(r'\[cite[^\]]*\]', '', text)
+    # Remove Markdown bolding (**) and italics (*)
+    text = re.sub(r'\*\*|\*', '', text)
+    # Remove list markers (*, -, +) at the beginning of lines
+    text = re.sub(r'^[\*\-\+]\s+', '', text, flags=re.MULTILINE)
+    # Replace AI with A. I.
     text = re.sub(r'\bAI\b', 'A. I.', text, flags=re.IGNORECASE)
     return text.strip()
 
@@ -226,6 +283,73 @@ def concatenate_videos(segment_paths: list[str], output_path: str, temp_dir: str
         if isinstance(e, subprocess.CalledProcessError):
             print(f"Stderr: {e.stderr}")
         sys.exit(1)
+
+def parse_script_file(script_file: str, page_count: int) -> dict[int, str]:
+    """
+    Parses the narration script file, extracting narration for each slide.
+    Narration for a slide starts after '(幻灯片 n: ...)' and ends before the next '---' or the next '(幻灯片 n+1: ...)' marker.
+    """
+    narrations = {}
+    try:
+        with open(script_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Find all slide markers and their positions
+        # Store (slide_num, start_of_marker_pos, end_of_marker_pos)
+        slide_marker_info = []
+        for match in re.finditer(r'\*\*\(幻灯片\s*(\d+):[^\)]*\)\*\*|\(幻灯片\s*(\d+):[^\)]*\)', content, re.DOTALL):
+            # Determine which group matched (bolded or non-bolded)
+            slide_num = int(match.group(1) or match.group(2))
+            slide_marker_info.append((slide_num, match.start(), match.end()))
+        
+        # Sort by slide number (should already be sorted by finditer, but good practice)
+        slide_marker_info.sort()
+
+        # Extract narration for each slide
+        for i, (current_slide_num, current_marker_start_pos, current_marker_end_pos) in enumerate(slide_marker_info):
+            current_narration_start_pos = current_marker_end_pos
+            # Advance past any trailing ** that belong to the marker
+            trailing_bold_match = re.match(r'^\s*\*\*', content[current_narration_start_pos:])
+            if trailing_bold_match:
+                current_narration_start_pos += trailing_bold_match.end()
+            narration_end_pos = len(content) # Default to end of file
+
+            # Find the position of the next slide marker (if any)
+            next_marker_start_pos = len(content)
+            if i + 1 < len(slide_marker_info):
+                next_marker_start_pos = slide_marker_info[i+1][1] # Start of the next marker
+
+            # Find the position of the next '---' after the current marker
+            # Search only up to the next marker to avoid finding '---' from later sections
+            search_limit_for_dash = min(len(content), next_marker_start_pos)
+            dash_match = re.search(r'\n---', content[current_narration_start_pos:search_limit_for_dash])
+            
+            if dash_match:
+                next_dash_pos = current_narration_start_pos + dash_match.start()
+                # The narration ends at the minimum of the next marker or the next dash
+                narration_end_pos = min(next_marker_start_pos, next_dash_pos)
+            else:
+                # If no '---' found, narration ends at the next marker or end of file
+                narration_end_pos = next_marker_start_pos
+            
+            # Ensure narration_end_pos is not before current_narration_start_pos
+            narration_end_pos = max(current_narration_start_pos, narration_end_pos)
+
+            narration_text = content[current_narration_start_pos:narration_end_pos].strip()
+            narrations[current_slide_num] = narration_text
+
+        # Ensure all slides have a narration entry, even if empty
+        for i in range(1, page_count + 1):
+            if i not in narrations:
+                narrations[i] = "" # Assign empty string for silent slides if no entry found
+
+    except FileNotFoundError:
+        print(f"Error: Script file not found at {script_file}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error parsing script file: {e}")
+        sys.exit(1)
+    return narrations
 
 def main():
     """Main function to run the script."""
